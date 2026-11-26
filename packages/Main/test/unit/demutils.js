@@ -7,8 +7,7 @@ import GlobeView from 'Core/Prefab/GlobeView';
 import { Coordinates, Extent } from '@itowns/geographic';
 import TileMesh from 'Core/TileMesh';
 import OBB from 'Renderer/OBB';
-import DEMUtils, { readTextureValueWithBilinearFiltering } from 'Utils/DEMUtils';
-import { computeTerrainRGBMinMax } from 'Parser/TerrainRGB';
+import DEMUtils, { readTextureValueWithBilinearFiltering, computeTerrainRGBMinMax } from 'Utils/DEMUtils';
 import { sharedReadContext2D } from 'Utils/CanvasUtils';
 import { LayeredMaterial } from 'Renderer/LayeredMaterial';
 import * as sinon from 'sinon';
@@ -38,8 +37,6 @@ describe('DemUtils', function () {
         assert.equal(readTextureValueWithBilinearFiltering(metadata, texture, 0.25, 0.25), 0);
         assert.equal(readTextureValueWithBilinearFiltering(metadata, texture, 0.75, 0.75), 3);
         assert.equal(readTextureValueWithBilinearFiltering(metadata, texture, 0.5, 0.5), 1.5);
-        assert.equal(readTextureValueWithBilinearFiltering(
-            { ...metadata, zmin: 2, zmax: 4, scale: 2, bias: 1 }, texture, 0.5, 0.5), 5);
     });
 
     it('decodes negative elevations and carries between Terrain-RGB channels', () => {
@@ -64,7 +61,7 @@ describe('DemUtils', function () {
         assert.deepEqual(bottomRight, { min: 7, max: 12 });
     });
 
-    it('reuses image readback and retains conservative bounds for transparent pixels', () => {
+    it('reads image textures and retains conservative bounds for transparent pixels', () => {
         const ctx = sharedReadContext2D();
         const draw = sinon.stub(ctx, 'drawImage');
         const read = sinon.stub(ctx, 'getImageData').returns({ data: new Uint8ClampedArray([1, 134, 160, 255]) });
@@ -72,10 +69,8 @@ describe('DemUtils', function () {
             const texture = new THREE.Texture({ width: 1, height: 1 });
             const pitch = new THREE.Vector4(0, 0, 1, 1);
             assert.deepEqual(computeTerrainRGBMinMax(texture, pitch), { min: -0.5, max: 0.5 });
-            computeTerrainRGBMinMax(texture, pitch);
             assert.equal(read.callCount, 1);
             read.returns({ data: new Uint8ClampedArray([0, 0, 0, 0]) });
-            texture.needsUpdate = true;
             assert.deepEqual(computeTerrainRGBMinMax(texture, pitch, -100, 5000), { min: -100, max: 5000 });
             assert.equal(read.callCount, 2);
         } finally {

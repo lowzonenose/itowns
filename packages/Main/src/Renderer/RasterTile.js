@@ -4,7 +4,7 @@ import LayerUpdateState from 'Layer/LayerUpdateState';
 import { nextLevelToFetch } from 'Layer/LayerUpdateStrategy';
 import handlingError from 'Process/handlerNodeError';
 import { checkNodeElevationTextureValidity, insertSignificantValuesFromParent, computeMinMaxElevation } from 'Parser/XbilParser';
-import { computeTerrainRGBMinMax } from 'Parser/TerrainRGB';
+import { computeTerrainRGBMinMax, TERRAIN_RGB_MIN_ELEVATION, TERRAIN_RGB_MAX_ELEVATION } from 'Utils/DEMUtils';
 
 export const EMPTY_TEXTURE_ZOOM = -1;
 
@@ -293,28 +293,23 @@ export class RasterElevationTile extends RasterTile {
         this.zmin = layer.zmin ?? defaultEle.zmin;
         this.zmax = layer.zmax ?? defaultEle.zmax;
 
-        layer.addEventListener('scale-property-changed', this._handlerCBEvent);
-    }
+        if (layer.useRgbaTextureElevation) {
+            // Conservative bounds, until a texture is parsed.
+            this.setTerrainRGBBounds({
+                min: Math.max(this.zmin, TERRAIN_RGB_MIN_ELEVATION),
+                max: Math.min(this.zmax, TERRAIN_RGB_MAX_ELEVATION),
+            });
+        }
 
-    get min() {
-        return this.layer.useRgbaTextureElevation ? this.terrainRGBBound(this._min ?? this.layer.zmin ?? -10000) : this._min;
-    }
-
-    set min(value) {
-        this._min = value;
-    }
-
-    get max() {
-        return this.layer.useRgbaTextureElevation ? this.terrainRGBBound(this._max ?? this.layer.zmax ?? (-10000 + 0xffffff * 0.1)) : this._max;
-    }
-
-    set max(value) {
-        this._max = value;
-    }
-
-    terrainRGBBound(value) {
-        return THREE.MathUtils.clamp(value, -10000, -10000 + 0xffffff * 0.1) +
-            (this.bias ?? 0) / (this.layer.scale || 1);
+        // The Terrain-RGB bounds depend on the layer scale (see setTerrainRGBBounds).
+        this._handlerScaleChanged = () => {
+            this._handlerCBEvent();
+            if (this.layer.useRgbaTextureElevation) {
+                this.updateMinMaxElevation();
+                this.dispatchEvent({ type: 'rasterElevationLevelChanged', node: this });
+            }
+        };
+        layer.addEventListener('scale-property-changed', this._handlerScaleChanged);
     }
 
     get scale() {
@@ -324,7 +319,7 @@ export class RasterElevationTile extends RasterTile {
     dispose(removeEvent) {
         super.dispose(removeEvent);
         if (removeEvent) {
-            this.layer.removeEventListener('scale-property-changed', this._handlerCBEvent);
+            this.layer.removeEventListener('scale-property-changed', this._handlerScaleChanged);
         }
     }
 
@@ -360,13 +355,23 @@ export class RasterElevationTile extends RasterTile {
         }
     }
 
+    /**
+     * Sets the elevation bounds from Terrain-RGB values. The OBB scales `min` and `max`
+     * while the shader adds the bias unscaled, so the bias is converted to raw units here.
+     *
+     * @param {{min: number, max: number}} bounds - The bounds, in raw elevation units.
+     */
+    setTerrainRGBBounds({ min, max }) {
+        const bias = (this.bias ?? 0) / (this.layer.scale || 1);
+        this.min = min + bias;
+        this.max = max + bias;
+    }
+
     updateMinMaxElevation() {
         const firstValidIndex = this.textures.findIndex(texture => texture?.isTexture);
         if (firstValidIndex !== -1 && this.layer.useRgbaTextureElevation) {
-            const { min, max } = computeTerrainRGBMinMax(
-                this.textures[firstValidIndex], this.offsetScales[firstValidIndex], this.zmin, this.zmax);
-            this.min = min;
-            this.max = max;
+            this.setTerrainRGBBounds(computeTerrainRGBMinMax(
+                this.textures[firstValidIndex], this.offsetScales[firstValidIndex], this.zmin, this.zmax));
         } else if (firstValidIndex !== -1 && !this.layer.useColorTextureElevation) {
             const { min, max } = computeMinMaxElevation(
                 this.textures[firstValidIndex],

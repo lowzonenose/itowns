@@ -12,7 +12,7 @@ const formats = {
 
 const browser = await launch({
     executablePath: process.env.CHROME_PATH,
-    args: ['--enable-gpu', '--use-gl=angle', '--use-angle=gl', '--ignore-gpu-blocklist'],
+    args: ['--no-sandbox', '--enable-gpu', '--use-gl=angle', '--use-angle=gl', '--ignore-gpu-blocklist'],
 });
 
 try {

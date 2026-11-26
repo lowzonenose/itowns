@@ -2,7 +2,10 @@ import * as THREE from 'three';
 import { Coordinates } from '@itowns/geographic';
 import { sharedReadContext2D } from 'Utils/CanvasUtils';
 import placeObjectOnGround from 'Utils/placeObjectOnGround';
-import { decodeTerrainRGB } from 'Parser/TerrainRGB';
+
+// Terrain-RGB (Mapbox) encoding: elevation = -10000 + (R * 65536 + G * 256 + B) * 0.1
+export const TERRAIN_RGB_MIN_ELEVATION = -10000;
+export const TERRAIN_RGB_MAX_ELEVATION = TERRAIN_RGB_MIN_ELEVATION + 0xffffff * 0.1;
 
 const FAST_READ_Z = 0;
 const PRECISE_READ_Z = 1;
@@ -108,6 +111,38 @@ function tileAt(pt, tile) {
     }
 }
 
+/**
+ * Reads the RGBA pixels of a rectangular region of an image texture
+ * (texture without `image.data`) with a 2D canvas.
+ *
+ * @param {THREE.Texture} texture - The texture to read.
+ * @param {number} minx - The x coordinate (in texels) of the region.
+ * @param {number} miny - The y coordinate (in texels) of the region.
+ * @param {number} dw - The width (in texels) of the region.
+ * @param {number} dh - The height (in texels) of the region.
+ * @returns {ImageData} The pixels of the region, 4 bytes per texel.
+ */
+function _readImageRegion(texture, minx, miny, dw, dh) {
+    const ctx = sharedReadContext2D();
+    ctx.canvas.width = Math.max(ctx.canvas.width, dw);
+    ctx.canvas.height = Math.max(ctx.canvas.height, dh);
+
+    ctx.drawImage(texture.image, minx, miny, dw, dh, 0, 0, dw, dh);
+    return ctx.getImageData(0, 0, dw, dh);
+}
+
+/**
+ * Decodes an elevation encoded with the Terrain-RGB encoding.
+ * It is not an IEEE 754 float encoding.
+ *
+ * @param {ArrayLike<number>} data - RGBA bytes.
+ * @param {number} index - Index of the red channel of the texel.
+ * @returns {number} The elevation in meters.
+ */
+export function decodeTerrainRGB(data, index) {
+    return TERRAIN_RGB_MIN_ELEVATION + (data[index] * 65536 + data[index + 1] * 256 + data[index + 2]) * 0.1;
+}
+
 function _readTextureValueAt(metadata, texture, ...uv) {
     for (let i = 0; i < uv.length; i += 2) {
         uv[i] = THREE.MathUtils.clamp(uv[i], 0, texture.image.width - 1);
@@ -149,12 +184,7 @@ function _readTextureValueAt(metadata, texture, ...uv) {
         const dw = maxx - minx + 1;
         const dh = maxy - miny + 1;
 
-        const ctx = sharedReadContext2D();
-        ctx.canvas.width = Math.max(ctx.canvas.width, dw);
-        ctx.canvas.height = Math.max(ctx.canvas.height, dh);
-
-        ctx.drawImage(texture.image, minx, miny, dw, dh, 0, 0, dw, dh);
-        const d = ctx.getImageData(0, 0, dw, dh);
+        const d = _readImageRegion(texture, minx, miny, dw, dh);
 
         const result = [];
         for (let i = 0; i < uv.length; i += 2) {
@@ -203,15 +233,72 @@ function _readTextureValueNearestFiltering(metadata, texture, vertexU, vertexV) 
     const u = (coords.wu <= 0) ? coords.u1 : coords.u2;
     const v = (coords.wv <= 0) ? coords.v1 : coords.v2;
 
-    return _applyTerrainRGBOptions(metadata, _readTextureValueAt(metadata, texture, u, v));
+    return _readTextureValueAt(metadata, texture, u, v);
 }
 
-function _applyTerrainRGBOptions(metadata, value) {
-    if (!metadata.useRgbaTextureElevation || value == undefined) {
-        return value;
+/**
+ * Calculates the minimum and maximum elevation of a Terrain-RGB texture.
+ * Bounds are conservative: they include the texels used by linear filtering
+ * on the borders of the pitch, and a margin for single-precision shader arithmetic.
+ *
+ * @param {THREE.Texture} texture - The texture to parse.
+ * @param {THREE.Vector4} pitch - The pitch, restricts the zone to parse.
+ * @param {number} [zmin] - The minimum elevation value after which it will be clamped.
+ * @param {number} [zmax] - The maximum elevation value after which it will be clamped.
+ * @returns {{min: number, max: number}} The minimum and maximum elevation.
+ */
+export function computeTerrainRGBMinMax(texture, pitch, zmin = -Infinity, zmax = Infinity) {
+    const { width, height, data } = texture.image;
+    const lower = Math.max(zmin, TERRAIN_RGB_MIN_ELEVATION);
+    const upper = Math.min(zmax, TERRAIN_RGB_MAX_ELEVATION);
+
+    // Include neighboring texels used by linear filtering at the child tile's boundaries.
+    const minX = THREE.MathUtils.clamp(Math.floor(pitch.x * width - 0.5), 0, width - 1);
+    const maxX = THREE.MathUtils.clamp(Math.ceil((pitch.x + pitch.z) * width - 0.5), 0, width - 1);
+    const minY = THREE.MathUtils.clamp(Math.floor(pitch.y * height - 0.5), 0, height - 1);
+    const maxY = THREE.MathUtils.clamp(Math.ceil((pitch.y + pitch.w) * height - 0.5), 0, height - 1);
+    const regionWidth = maxX - minX + 1;
+    const regionHeight = maxY - minY + 1;
+
+    let pixels;
+    let first;
+    let stride;
+    if (data) {
+        if (texture.format !== THREE.RGBAFormat || texture.type !== THREE.UnsignedByteType ||
+            data.length !== width * height * 4) {
+            throw new Error('Terrain-RGB data textures must contain 8-bit RGBA pixels');
+        }
+        pixels = data;
+        first = minY * width + minX;
+        stride = width;
+    } else {
+        pixels = _readImageRegion(texture, minX, minY, regionWidth, regionHeight).data;
+        first = 0;
+        stride = regionWidth;
     }
-    return THREE.MathUtils.clamp(value, metadata.zmin ?? -Infinity, metadata.zmax ?? Infinity) *
-        (metadata.scale ?? 1) + (metadata.bias ?? 0);
+
+    let min = Infinity;
+    let max = -Infinity;
+    for (let y = 0; y < regionHeight; y++) {
+        for (let x = 0; x < regionWidth; x++) {
+            const index = 4 * (first + y * stride + x);
+            // Canvas readback can alter RGB values of transparent image pixels.
+            if (!data && pixels[index + 3] !== 255) {
+                return {
+                    min: THREE.MathUtils.clamp(TERRAIN_RGB_MIN_ELEVATION, lower, upper),
+                    max: THREE.MathUtils.clamp(TERRAIN_RGB_MAX_ELEVATION, lower, upper),
+                };
+            }
+            const value = decodeTerrainRGB(pixels, index);
+            min = Math.min(min, value);
+            max = Math.max(max, value);
+        }
+    }
+    // Account for single-precision shader arithmetic when decoding interpolated channels.
+    return {
+        min: THREE.MathUtils.clamp(min - 0.5, lower, upper),
+        max: THREE.MathUtils.clamp(max + 0.5, lower, upper),
+    };
 }
 
 function _lerpWithUndefinedCheck(x, y, t) {
@@ -238,7 +325,7 @@ export function readTextureValueWithBilinearFiltering(metadata, texture, vertexU
     const zu1 = _lerpWithUndefinedCheck(z11, z21, coords.wu);
     const zu2 = _lerpWithUndefinedCheck(z12, z22, coords.wu);
     // then vertical filtering
-    return _applyTerrainRGBOptions(metadata, _lerpWithUndefinedCheck(zu1, zu2, coords.wv));
+    return _lerpWithUndefinedCheck(zu1, zu2, coords.wv);
 }
 
 
